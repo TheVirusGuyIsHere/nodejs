@@ -1,133 +1,135 @@
 const express = require("express");
+const path = require("path");
+const crypto = require("crypto");
 const axios = require("axios");
 const multer = require("multer");
 const FormData = require("form-data");
-const crypto = require("crypto");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const sqlite3 = require("sqlite3").verbose();
 
 const app = express();
-app.use(express.json({limit:"25mb"}));
+const PORT = process.env.PORT || 3000;
+const BASE_URL = "https://whp.mouz.dev";
+
+app.set("trust proxy", 1);
 app.use(helmet());
 
-/* ---------------- DATABASE ---------------- */
+/* -------------------------
+   STATIC WEBSITE (works again)
+--------------------------*/
+app.use(express.static(path.join(__dirname,"public")));
 
+/* regular json for API routes */
+app.use("/api", express.json({limit:"25mb"}));
+
+/* -------------------------
+   DATABASE
+--------------------------*/
 const db = new sqlite3.Database("./webhooks.db");
 
-db.serialize(()=>{
+db.serialize(() => {
 
 db.run(`
 CREATE TABLE IF NOT EXISTS webhooks (
- id INTEGER PRIMARY KEY AUTOINCREMENT,
- client_id TEXT UNIQUE,
- public_token TEXT UNIQUE,
- secret_key TEXT,
- discord_webhook TEXT,
- revoked INTEGER DEFAULT 0,
- created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+public_token TEXT UNIQUE,
+secret_key TEXT,
+discord_webhook TEXT,
+revoked INTEGER DEFAULT 0,
+created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 )
 `);
 
 });
 
-
-/* ---------------- SECURITY ---------------- */
-
-function rand(len=64){
- return crypto.randomBytes(len).toString("hex");
+/* -------------------------
+   HELPERS
+--------------------------*/
+function rand(bytes=32){
+ return crypto.randomBytes(bytes).toString("hex");
 }
 
-function signValid(req, secret){
-
- const sig=req.headers["x-signature"];
- if(!sig) return false;
-
- const body=JSON.stringify(req.body || {});
- const expected=crypto
-  .createHmac("sha256",secret)
-  .update(body)
-  .digest("hex");
-
- return crypto.timingSafeEqual(
-   Buffer.from(sig),
-   Buffer.from(expected)
- );
+function getWebhookByToken(token){
+ return new Promise((resolve,reject)=>{
+   db.get(
+    "SELECT * FROM webhooks WHERE public_token=? AND revoked=0",
+    [token],
+    (e,row)=> e ? reject(e):resolve(row)
+   );
+ });
 }
 
-/* -------- rate limiting per webhook -------- */
-
-const limiter=rateLimit({
- windowMs:60*1000,
+/* -------------------------
+   RATE LIMIT
+--------------------------*/
+app.use("/wh",rateLimit({
+ windowMs:60000,
  max:30
-});
+}));
 
-app.use("/wh",limiter);
-
-
-
-/* ------------- create protected webhook ------------- */
-
+/* -------------------------
+   CREATE PROTECTED WEBHOOK
+   no app ids anymore
+--------------------------*/
 app.post("/api/create/discordwebhook",(req,res)=>{
 
- const {client_id,discord_webhook}=req.body;
+const {discord_webhook}=req.body;
 
- if(!client_id || !discord_webhook){
-   return res.status(400).json({error:"missing"});
- }
+if(!discord_webhook){
+ return res.status(400).json({
+   error:"discord_webhook required"
+ });
+}
 
- const publicToken=rand(24);
- const secretKey=rand(32);
+const publicToken=rand(24);
+const secretKey=rand(32);
 
- db.run(`
- INSERT INTO webhooks(
- client_id,
+db.run(`
+INSERT INTO webhooks(
  public_token,
  secret_key,
  discord_webhook
- ) VALUES(?,?,?,?)
- `,
- [client_id,publicToken,secretKey,discord_webhook],
- function(err){
+) VALUES(?,?,?)
+`,
+[publicToken,secretKey,discord_webhook],
+function(err){
 
-   if(err){
-      return res.status(409).json({
-       error:"exists"
-      });
-   }
-
-   res.json({
-    proxy_webhook:
-      `${req.protocol}://${req.get("host")}/wh/${publicToken}`,
-    signing_secret:secretKey
+ if(err){
+   return res.status(500).json({
+     error:"db insert failed"
    });
+ }
 
- });
+res.json({
+ proxy_webhook:`${BASE_URL}/wh/${publicToken}`,
+ signing_secret:secretKey
+});
 
 });
 
+});
 
-/* ---------- search existing ---------- */
-
-app.get("/api/search/discordwebhook",(req,res)=>{
-
-const client=req.query.client_id;
+/* -------------------------
+   LOOKUP BY PROTECTED TOKEN
+--------------------------*/
+app.get("/api/search/discordwebhook/:token",(req,res)=>{
 
 db.get(
-"SELECT public_token FROM webhooks WHERE client_id=? AND revoked=0",
-[client],
+"SELECT public_token,created_at FROM webhooks WHERE public_token=? AND revoked=0",
+[req.params.token],
 (err,row)=>{
 
  if(!row){
    return res.status(404).json({
-     exists:false
+    exists:false
    });
  }
 
  res.json({
    exists:true,
-   webhook:
-`${req.protocol}://${req.get("host")}/wh/${row.public_token}`
+   webhook:`${BASE_URL}/wh/${row.public_token}`,
+   created_at:row.created_at
  });
 
 });
@@ -135,85 +137,77 @@ db.get(
 });
 
 
-/* ---------- rotate webhook ---------- */
+/* -------------------------
+   ROTATE
+--------------------------*/
+app.post("/api/rotate/:token",(req,res)=>{
 
-app.post("/api/rotate/:client",(req,res)=>{
-
- const token=rand(24);
-
- db.run(
-`UPDATE webhooks
-SET public_token=?
-WHERE client_id=?`,
-[token,req.params.client],
-()=>{
-
-res.json({
- rotated:true,
- new_webhook:
-`${req.protocol}://${req.get("host")}/wh/${token}`
-});
-
-});
-
-});
-
-
-/* ---------- revoke ---------- */
-
-app.post("/api/revoke/:client",(req,res)=>{
+const newToken=rand(24);
 
 db.run(
-"UPDATE webhooks SET revoked=1 WHERE client_id=?",
-[req.params.client],
+"UPDATE webhooks SET public_token=? WHERE public_token=?",
+[newToken,req.params.token],
+function(){
+
+res.json({
+ new_webhook:`${BASE_URL}/wh/${newToken}`
+});
+
+});
+
+});
+
+
+/* -------------------------
+   REVOKE
+--------------------------*/
+app.post("/api/revoke/:token",(req,res)=>{
+
+db.run(
+"UPDATE webhooks SET revoked=1 WHERE public_token=?",
+[req.params.token],
 ()=>res.json({revoked:true})
 );
 
 });
 
 
-/* ------------ multipart upload support ----------- */
-
-const upload=multer({
- storage:multer.memoryStorage()
-});
-
-
-/*
-Supports:
-content
-embeds
-files
-username
-avatar_url
-?wait=true
-?thread_id=
-*/
+/* -------------------------
+ RAW JSON WEBHOOK ROUTE
+ exact body preserved for HMAC
+--------------------------*/
 app.post(
 "/wh/:token",
-upload.any(),
+express.raw({
+ type:["application/json"],
+ limit:"25mb"
+}),
 async(req,res)=>{
 
-db.get(
-`SELECT * FROM webhooks
- WHERE public_token=?
- AND revoked=0`,
-[req.params.token],
+try{
 
-async(err,row)=>{
+const row=await getWebhookByToken(
+ req.params.token
+);
 
 if(!row)
  return res.sendStatus(404);
 
+const sig=req.headers["x-signature"];
 
-/* HMAC auth */
-if(!signValid(req,row.secret_key)){
+const expected=crypto
+.createHmac(
+ "sha256",
+ row.secret_key
+)
+.update(req.body)
+.digest("hex");
+
+if(sig!==expected){
  return res.status(403).json({
   error:"bad signature"
  });
 }
-
-try{
 
 const params={};
 
@@ -223,77 +217,28 @@ if(req.query.wait)
 if(req.query.thread_id)
  params.thread_id=req.query.thread_id;
 
+const jsonBody=JSON.parse(
+ req.body.toString()
+);
 
-/* multipart passthrough */
-let response;
-
-if(req.files?.length){
-
- const form=new FormData();
-
- Object.keys(req.body).forEach(k=>{
-   form.append(k,req.body[k]);
- });
-
- req.files.forEach((f,i)=>{
-   form.append(
-     `files[${i}]`,
-      f.buffer,
-      f.originalname
-   );
- });
-
- response=await axios.post(
-   row.discord_webhook,
-   form,
-   {
-    params,
-    headers:form.getHeaders()
-   }
- );
-
-}
-else{
-
-response=await axios.post(
+const r=await axios.post(
  row.discord_webhook,
- req.body,
+ jsonBody,
  {
-   params,
-   headers:{
-    "Content-Type":"application/json"
-   }
- });
-
-}
-
-
-/* pass Discord rate limit headers through */
-[
-"x-ratelimit-limit",
-"x-ratelimit-remaining",
-"x-ratelimit-reset"
-].forEach(h=>{
- if(response.headers[h]){
-   res.setHeader(
-    h,
-    response.headers[h]
-   );
+   params
  }
-});
+);
 
-
-return res
-.status(response.status)
-.send(response.data);
-
+res
+.status(r.status)
+.send(r.data);
 
 }catch(e){
 
 if(e.response){
  return res
-  .status(e.response.status)
-  .send(e.response.data);
+ .status(e.response.status)
+ .send(e.response.data);
 }
 
 res.status(500).json({
@@ -302,10 +247,84 @@ res.status(500).json({
 
 }
 
+}
+);
+
+/* -------------------------
+ MULTIPART FILE WEBHOOK
+--------------------------*/
+const upload=multer({
+ storage:multer.memoryStorage()
 });
+
+app.post(
+"/wh/:token/files",
+upload.any(),
+async(req,res)=>{
+
+try{
+
+const row=await getWebhookByToken(
+ req.params.token
+);
+
+if(!row)
+ return res.sendStatus(404);
+
+const form=new FormData();
+
+Object.keys(req.body).forEach(k=>{
+ form.append(k,req.body[k]);
+});
+
+req.files.forEach((f,i)=>{
+ form.append(
+  `files[${i}]`,
+  f.buffer,
+  f.originalname
+ );
+});
+
+const r=await axios.post(
+ row.discord_webhook,
+ form,
+ {
+  headers:form.getHeaders()
+ }
+);
+
+res
+.status(r.status)
+.send(r.data);
+
+}catch(e){
+res.status(500).json({
+ error:"upload relay failed"
+});
+}
 
 });
 
-app.listen(3000,()=>{
- console.log("running");
+
+/* -------------------------
+ homepage fallback
+--------------------------*/
+app.get("/",(req,res)=>{
+res.sendFile(
+ path.join(__dirname,"public","index.html")
+);
+});
+
+
+/* 404 */
+app.use((req,res)=>{
+res.status(404).sendFile(
+path.join(__dirname,"public","404.html")
+);
+});
+
+app.listen(PORT,()=>{
+ console.log(
+  "running on "+PORT
+ );
 });
