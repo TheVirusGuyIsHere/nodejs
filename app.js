@@ -29,42 +29,34 @@ db.serialize(() => {
   `);
 });
 
-function genToken() {
+function token() {
   return crypto.randomBytes(32).toString("hex");
 }
 
-function getWebhook(token) {
+function get(token) {
   return new Promise((resolve, reject) => {
     db.get(
-      "SELECT * FROM webhooks WHERE token = ?",
+      "SELECT * FROM webhooks WHERE token=?",
       [token],
-      (err, row) => {
-        if (err) reject(err);
-        else resolve(row);
-      }
+      (e, r) => (e ? reject(e) : resolve(r))
     );
   });
 }
 
-app.post("/api/create", (req, res) => {
+app.post("/api/create/discordwebhook", (req, res) => {
   const { discord_webhook } = req.body;
+  if (!discord_webhook) return res.status(400).json({ error: "missing" });
 
-  if (!discord_webhook) {
-    return res.status(400).json({ error: "missing webhook" });
-  }
-
-  const token = genToken();
+  const t = token();
 
   db.run(
-    "INSERT INTO webhooks (token, discord_webhook) VALUES (?, ?)",
-    [token, discord_webhook],
-    (err) => {
-      if (err) {
-        return res.status(500).json({ error: "db error" });
-      }
+    "INSERT INTO webhooks(token,discord_webhook) VALUES(?,?)",
+    [t, discord_webhook],
+    (e) => {
+      if (e) return res.status(500).json({ error: "db error" });
 
       res.json({
-        proxy_webhook: `${req.protocol}://${req.get("host")}/wh/${token}`
+        proxy_webhook: `${req.protocol}://${req.get("host")}/wh/${t}`
       });
     }
   );
@@ -72,22 +64,20 @@ app.post("/api/create", (req, res) => {
 
 app.get("/api/search/:token", (req, res) => {
   db.get(
-    "SELECT token FROM webhooks WHERE token = ?",
+    "SELECT token FROM webhooks WHERE token=?",
     [req.params.token],
-    (err, row) => {
-      if (!row) return res.json({ exists: false });
-
+    (e, r) => {
+      if (!r) return res.json({ exists: false });
       res.json({
         exists: true,
-        webhook: `${req.protocol}://${req.get("host")}/wh/${row.token}`
+        webhook: `${req.protocol}://${req.get("host")}/wh/${r.token}`
       });
     }
   );
 });
 
 app.post("/wh/:token", async (req, res) => {
-  const row = await getWebhook(req.params.token);
-
+  const row = await get(req.params.token);
   if (!row) return res.sendStatus(404);
 
   try {
@@ -97,10 +87,7 @@ app.post("/wh/:token", async (req, res) => {
 
     res.status(r.status).send(r.data);
   } catch (e) {
-    if (e.response) {
-      return res.status(e.response.status).send(e.response.data);
-    }
-
+    if (e.response) return res.status(e.response.status).send(e.response.data);
     res.status(500).json({ error: "failed" });
   }
 });
@@ -108,8 +95,7 @@ app.post("/wh/:token", async (req, res) => {
 const upload = multer({ storage: multer.memoryStorage() });
 
 app.post("/wh/:token/files", upload.any(), async (req, res) => {
-  const row = await getWebhook(req.params.token);
-
+  const row = await get(req.params.token);
   if (!row) return res.sendStatus(404);
 
   const form = new FormData();
@@ -126,7 +112,7 @@ app.post("/wh/:token/files", upload.any(), async (req, res) => {
     });
 
     res.status(r.status).send(r.data);
-  } catch (e) {
+  } catch {
     res.status(500).json({ error: "upload failed" });
   }
 });
@@ -140,5 +126,5 @@ app.use((req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log("running on " + PORT);
+  console.log("running " + PORT);
 });
